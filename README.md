@@ -20,7 +20,7 @@ python -m pip install -U pip setuptools wheel
 Download cuda12.1 at: https://developer.nvidia.com/cuda-12-1-0-download-archive
 
 ```bash
-# Using Linux System: 
+# Using Linux System with Navida GPU: 
 pip install -r requirements-cu121.txt
 
 # or using CPU:
@@ -43,10 +43,14 @@ PY
 python train.py
 ```
 
+## 4. Training with Ablation Study
+adjust the parameters (patch size, dim, depth, heads) and compare training results.
+```bash
+python train_ablation.py
+```
 
-
-## 4. Evaluation/Verification
-
+## 5. Evaluation/Verification
+Load trained data from checkpoints and varify accuracy.
 ```bash
 python eval.py --ckpt checkpoints/tinycnn_cifar10_best.pth
 
