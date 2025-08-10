@@ -1,4 +1,6 @@
-```bush
+## 0. Clone this Project:
+
+```bash
 git clone https://github.com/JingyuCheng1014/Cifar-10-implementations.git
 cd /path/to/Cifar-10-implementations
 ```
