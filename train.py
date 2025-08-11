@@ -9,7 +9,6 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from data.cifar10 import get_dataloaders
-# ✨ 使用 vit.py 中的 ViT
 from model.vit import ViT
 
 
@@ -56,6 +55,7 @@ def visualize_one_batch(loader, classes):
     imgs, labels = next(iter(loader))
     grid = vutils.make_grid(imgs[:32], nrow=8, padding=2)
     grid = denormalize(grid)
+    grid = grid.squeeze(0)
     npimg = grid.clamp(0, 1).permute(1, 2, 0).cpu().numpy()
     plt.figure(figsize=(10, 5))
     plt.imshow(npimg)
@@ -121,7 +121,7 @@ def main(cfg: Cfg):
     classes = train_loader.dataset.classes
 
     # 可视化一个 batch
-    visualize_one_batch(train_loader, classes)
+    # visualize_one_batch(train_loader, classes)
 
     # ✨ 使用 ViT（来自 vit.py）
     # CIFAR-10: 32x32x3；选 patch_size=4（=> 8x8=64 个 patch）
