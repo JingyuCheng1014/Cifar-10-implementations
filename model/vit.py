@@ -1,51 +1,104 @@
 import torch
-from torch import nn
-
+import torch.nn as nn
 from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
+from einops.layers.flax import Rearrange
 
 
 def pair(t):
     """
     将输入参数转化为元组。
-
     Args:
         t (any): 输入参数，可以是任意类型。
 
     Returns:
         tuple: 如果输入参数已经是元组，则返回原元组；否则返回一个新元组，元组中的两个元素均为输入参数的值。
-
     """
     return t if isinstance(t, tuple) else (t, t)
 
-
-# classes
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.):
+class PatchEmbedding(nn.Module):
+    def __init__(self, image_size, patch_size, dim, **kwargs):
         """
-        初始化函数。
-        Args:
-            dim (int): 输入和输出的维度。
-            hidden_dim (int): 隐藏层的维度。
-            dropout (float, optional): Dropout比率，用于防止过拟合。默认为0.0。
-        Returns:
-            None
-        Raises:
-            无
+        把图像切成不重叠patch并映射到dim维度的embedding空间
+        输入:  (B, C, H, W)
+        输出:  (B, N, dim)  其中 N = (H/Ph) * (W/Pw)
         """
         super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout)
-        )
+        self.num_channels = kwargs.get('num_channels', 3)
 
-    def forward(self, x):
-        return self.net(x)
+        image_height, image_width = pair(image_size)
+        patch_height, patch_width = pair(patch_size)
+
+        assert image_height % patch_height == 0 and image_width % patch_width == 0, \
+            'Image dimensions must be divisible by patch size'
+
+        self.patch_height = patch_height
+        self.patch_width = patch_width
+
+        # patch 数和每个 patch 的原始维度
+        self.num_patches = (image_height // patch_height) * (image_width // patch_width)
+        patch_dim = self.num_channels * patch_height * patch_width
+
+        # 线性投影到 dim
+        self.proj = nn.Linear(patch_dim, dim)
+
+        # （可选）做个轻量归一化，稳定训练
+        self.pre_norm = nn.LayerNorm(patch_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, H, W)
+        return: (B, N, dim)
+        """
+        # 把每个 patch 展平成一个向量: (B, C, H, W) -> (B, N, Ph*Pw*C)
+        x = rearrange(
+            x,
+            'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',
+            p1=self.patch_height, p2=self.patch_width
+        )
+        x = self.pre_norm(x)
+        x = self.proj(x)  # (B, N, dim)
+        return x
+
+
+class Embeddings(nn.Module):
+    def __init__(self, image_size, patch_size, dim, **kwargs):
+        """
+        组合 PatchEmbedding + [CLS] token + 位置编码 + dropout
+        最终输出给 Transformer 的序列: (B, N+1, dim)
+        """
+        super().__init__()
+        self.patch_embedding = PatchEmbedding(image_size, patch_size, dim, **kwargs)
+
+        # 可学习的 [CLS] token，shape = (1, 1, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+
+        # 可学习的位置编码，包含 N 个 patch 再加 1 个 CLS 位置
+        num_patches = self.patch_embedding.num_patches
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+
+        # dropout
+        self.dropout = nn.Dropout(kwargs.get('emb_dropout', 0.1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, H, W) -> (B, N+1, dim)
+        """
+        # 1) patch embed
+        x = self.patch_embedding(x)        # (B, N, dim)
+        B, N, D = x.shape
+
+        # 2) prepend CLS token
+        cls = repeat(self.cls_token, '1 1 d -> b 1 d', b=B)  # (B, 1, dim)
+        x = torch.cat([cls, x], dim=1)                       # (B, N+1, dim)
+
+        # 3) add positional embedding（按实际长度截取）
+        x = x + self.pos_embedding[:, :N+1, :]
+
+        # 4) dropout
+        x = self.dropout(x)
+        return x
+
+
 
 
 class Attention(nn.Module):
@@ -102,6 +155,40 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 
+
+
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.):
+        """
+        初始化函数。
+        Args:
+            dim (int): 输入和输出的维度。
+            hidden_dim (int): 隐藏层的维度。
+            dropout (float, optional): Dropout比率，用于防止过拟合。默认为0.0。
+        Returns:
+            None
+        Raises:
+            无
+        """
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+
+
+
 class Transformer(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout=0.):
         """
@@ -131,6 +218,8 @@ class Transformer(nn.Module):
             x = ff(x) + x
 
         return self.norm(x)
+
+
 
 
 class ViT(nn.Module):
@@ -205,24 +294,3 @@ class ViT(nn.Module):
         return self.mlp_head(x)
 
 
-if __name__ == '__main__':
-    model = ViT(
-        image_size=224,
-        patch_size=16,
-        num_classes=10,
-        dim=768,
-        depth=12,
-        heads=8,
-        mlp_dim=768 * 4,
-        pool='cls',
-        channels=3,
-        dropout=0.1,
-        emb_dropout=0.
-    )
-
-    print(model)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters:      {total_params:,}")
-    print(f"Trainable parameters:  {trainable_params:,}")
