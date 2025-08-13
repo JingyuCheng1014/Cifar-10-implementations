@@ -7,7 +7,7 @@ import torch.optim as optim
 from torchvision import utils as vutils
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-
+from config import cfg, VIT, build_model
 from data.cifar10 import get_dataloaders
 from model.vit import ViT
 
@@ -123,19 +123,10 @@ def main(cfg: Cfg):
     # 可视化一个 batch
     # visualize_one_batch(train_loader, classes)
 
-    # ✨ 使用 ViT（来自 vit.py）
+    # 使用 ViT（来自 vit.py）
     # CIFAR-10: 32x32x3；选 patch_size=4（=> 8x8=64 个 patch）
-    model = ViT(
-        image_size=32,
-        patch_size=4,
-        num_classes=10,
-        dim=256,          # Transformer hidden size
-        depth=6,          # Transformer layers
-        heads=8,          # Multi-head attention heads
-        mlp_dim=512,      # FFN hidden size
-        dropout=0.1,
-        emb_dropout=0.1
-    ).to(device)
+    model = build_model("vit", **VIT).to(device)
+
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr)
