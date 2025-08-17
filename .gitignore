@@ -135,4 +135,9 @@ dmypy.json
 .pyre/
 
 # Ignore all the *.idea documents
-*.idea
+*.ideacheckpoints/
+*.pth
+
+checkpoints/
+*.pth
+

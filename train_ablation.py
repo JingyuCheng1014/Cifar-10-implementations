@@ -10,6 +10,7 @@ from torchvision import datasets, transforms, utils as vutils
 import matplotlib.pyplot as plt
 from torchvision.datasets import CIFAR10
 from tqdm import tqdm
+import math
 
 
 # =========================
@@ -20,18 +21,20 @@ class Cfg:
     data_root: str
     batch_size: int
     num_workers: int
-    # 下面是训练用到的最小超参（可以改）
-    epochs: int = 50  # 可改
-    lr: float = 3e-4  # 学习率，优化器更新时的步长
-    weight_decay: float = 5e-2
-    warmup_epochs: int = 5  # 线性 warmup 轮数（0 关闭）
+    # 训练超参
+    epochs: int = 100
+    lr: float = 3e-4                   # 学习率，优化器更新时的步长，warmup+cosine 的 base lr
+    weight_decay: float = 0.05
+    warmup_ratio: float = 0.05         # 5% steps 用于 warmup
+    min_lr: float = 1e-6               # 余弦衰减到的最小 lr
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 cfg = Cfg(
     data_root="./data",
-    batch_size=128,
+    batch_size=512,
     num_workers=4,
+    epochs=2,
 )
 
 
@@ -251,10 +254,12 @@ def visualize_one_batch(loader, classes):
 # =========================
 # 5) 训练 & 验证
 # =========================
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, loader, optimizer, scheduler, criterion, device, lr_history, print_every=100):
     model.train()
     running_loss, correct, total = 0.0, 0, 0
     pbar = tqdm(loader, desc="Train", leave=False)
+    step_in_epoch = 0
+
     for imgs, labels in pbar:
         imgs   = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -265,11 +270,22 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         loss.backward()
         optimizer.step()
 
+        # ---- scheduler: 每个 step 更新 ----
+        scheduler.step()
+
+        # 记录 & 偶尔打印学习率
+        curr_lr = optimizer.param_groups[0]['lr']
+        lr_history.append(curr_lr)
+        step_in_epoch += 1
+        if step_in_epoch % print_every == 0:
+            print(f"  [step {step_in_epoch:4d}] lr={curr_lr:.6e}")
+
         running_loss += loss.item() * imgs.size(0)
         _, preds = logits.max(1)
         correct  += preds.eq(labels).sum().item()
         total    += labels.size(0)
         pbar.set_postfix(loss=running_loss/total, acc=correct/total)
+
     return running_loss/total, correct/total
 
 @torch.no_grad()
@@ -293,7 +309,6 @@ def evaluate(model, loader, criterion, device):
 
 def run_ablation(train_loader, val_loader, device, cfg, patch_size=4, dim=128, depth=6, heads=8, tag_prefix=""):
     """训练一个配置，返回 best_val_acc, sec/epoch, params，并将 best checkpoint 与曲线保存到磁盘"""
-    # 合法性检查（避免 heads 不整除）
     assert dim % heads == 0, f"d_model {dim} must be divisible by nhead {heads}"
 
     config_name = f"{tag_prefix}ps{patch_size}_dim{dim}_d{depth}_h{heads}"
@@ -302,35 +317,46 @@ def run_ablation(train_loader, val_loader, device, cfg, patch_size=4, dim=128, d
     model = ViT(patch_size=patch_size, dim=dim, depth=depth, heads=heads, num_classes=10).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+
+    # ==== warmup + cosine scheduler（按 step 更新）====
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * cfg.epochs
+    warmup_steps = int(cfg.warmup_ratio * total_steps)
+    base_lr = cfg.lr
+    min_lr = cfg.min_lr
+
+    from torch.optim.lr_scheduler import LambdaLR
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))  # 0->1
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1->0
+        return (min_lr / base_lr) + (1 - (min_lr / base_lr)) * cosine
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
 
-    history = []
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "lr": []}
     best_val_acc, best_state = 0.0, None
 
     t0 = time.perf_counter()
     for epoch in range(cfg.epochs):
-        # 简单 warmup
-        if cfg.warmup_epochs > 0 and epoch < cfg.warmup_epochs:
-            warmup_lr = cfg.lr * float(epoch + 1) / float(cfg.warmup_epochs)
-            for pg in optimizer.param_groups:
-                pg["lr"] = warmup_lr
-
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        print(f"\nEpoch [{epoch+1}/{cfg.epochs}]")
+        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, scheduler, criterion, device, history["lr"])
+        print(f" [epoch {epoch+1:3d}] lr={optimizer.param_groups[0]['lr']:.6e}")
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
-        history.append((epoch + 1, tr_loss, tr_acc, val_loss, val_acc))
-
-        if epoch >= cfg.warmup_epochs:
-            scheduler.step()
+        history["train_loss"].append(tr_loss)
+        history["train_acc"].append(tr_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
 
-        print(f"Epoch [{epoch + 1}/{cfg.epochs}] "
-              f"Train: loss={tr_loss:.4f} acc={tr_acc:.4f} | "
+        print(f"Train: loss={tr_loss:.4f} acc={tr_acc:.4f} | "
               f"Val: loss={val_loss:.4f} acc={val_acc:.4f} | "
               f"BestVal={best_val_acc:.4f}")
 
@@ -342,17 +368,50 @@ def run_ablation(train_loader, val_loader, device, cfg, patch_size=4, dim=128, d
     with open(f"logs/{config_name}.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["epoch", "train_loss", "train_acc", "val_loss", "val_acc"])
-        w.writerows(history)
+        for i in range(cfg.epochs):
+            w.writerow([i+1, history["train_loss"][i], history["train_acc"][i], history["val_loss"][i], history["val_acc"][i]])
 
     print(f"  ✓ Saved: checkpoints/vit_{config_name}_best.pth | logs/{config_name}.csv")
     print(f"  ✓ Params: {params / 1e6:.2f}M | sec/epoch: {sec_per_epoch:.3f}")
-    return best_val_acc, sec_per_epoch, params
+    return best_val_acc, sec_per_epoch, params, history, config_name
 
+def plot_curves(history, batch_size, epochs, model_name, outdir="checkpoints_ablation/plot"):
+    os.makedirs(outdir, exist_ok=True)
+    x_epoch = range(1, len(history["train_loss"]) + 1)
+    x_step = range(1, len(history["lr"]) + 1)
 
+    # Loss
+    plt.figure()
+    plt.plot(x_epoch, history["train_loss"], label="train")
+    plt.plot(x_epoch, history["val_loss"], label="val")
+    plt.xlabel("Epoch"); plt.ylabel("Loss")
+    plt.title(f"Loss over epochs — {model_name}")
+    plt.legend(); plt.grid(True, linestyle="--", alpha=0.5); plt.tight_layout()
+    plt.savefig(os.path.join(outdir, f"loss_curve_{model_name}_bs{batch_size}_ep{epochs}.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
 
-# =========================
-# 6) 主程序
-# =========================
+    # Accuracy
+    plt.figure()
+    plt.plot(x_epoch, history["train_acc"], label="train")
+    plt.plot(x_epoch, history["val_acc"], label="val")
+    plt.xlabel("Epoch"); plt.ylabel("Accuracy")
+    plt.title(f"Accuracy over epochs — {model_name}")
+    plt.legend(); plt.grid(True, linestyle="--", alpha=0.5); plt.tight_layout()
+    plt.savefig(os.path.join(outdir, f"acc_curve_{model_name}_bs{batch_size}_ep{epochs}.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # LR（按 step）
+    plt.figure()
+    plt.plot(x_step, history["lr"], label="lr")
+    plt.xlabel("Step"); plt.ylabel("Learning Rate")
+    plt.title(f"LR over steps (warmup+cosine) — {model_name}")
+    plt.legend(); plt.grid(True, linestyle="--", alpha=0.5); plt.tight_layout()
+    plt.savefig(os.path.join(outdir, f"lr_curve_{model_name}_bs{batch_size}_ep{epochs}.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
 def main(cfg: Cfg):
     device = torch.device(cfg.device)
     print(f"Using device: {device}")
@@ -363,72 +422,110 @@ def main(cfg: Cfg):
     # 可视化一个 batch（来自训练集）
     # visualize_one_batch(train_loader, classes)  # 可视化只在第一次运行时需要
 
-    base_cfg = dict(patch_size=4, dim=128, depth=6, heads=8)
+    base_cfg = dict(patch_size=4, dim=256, depth=6, heads=8)
     print("\n=== Baseline ===")
-    base_acc, base_sec, base_params = run_ablation(train_loader, val_loader, device, cfg, **base_cfg, tag_prefix="base_")
+    base_acc, base_sec, base_params, base_history, base_name = run_ablation(
+        train_loader, val_loader, device, cfg, **base_cfg, tag_prefix="base_")
     print(f"Baseline Acc={base_acc:.4f}, Params={base_params/1e6:.2f}M, sec/epoch={base_sec:.3f}")
-
-    # 默认参数
-    default_patch_size, default_dim, default_depth, default_heads = 4, 128, 6, 8
+    plot_curves(base_history, cfg.batch_size, cfg.epochs, base_name)
 
     results = []
 
-    # Patch Size Ablation
+    # Patch Size Ablation（其余参数均用base_cfg）
     print("\n=== Patch Size Ablation ===")
     best_patch = None
+    patch_results = []
     for patch in [2, 4, 8]:
-        acc, sec, params = run_ablation(train_loader, val_loader, device, cfg,
-                                        patch_size=patch, dim=base_cfg["dim"], depth=base_cfg["depth"],
-                                        heads=base_cfg["heads"],
-                                        tag_prefix="patch_")
+        acc, sec, params, history, name = run_ablation(
+            train_loader, val_loader, device, cfg,
+            patch_size=patch, dim=base_cfg["dim"], depth=base_cfg["depth"],
+            heads=base_cfg["heads"],
+            tag_prefix="patch_")
         results.append(("patch", patch, acc, sec, params))
+        patch_results.append((patch, params, sec, acc))
+        plot_curves(history, cfg.batch_size, cfg.epochs, name)
         if (best_patch is None) or (acc > best_patch[1]):
             best_patch = (patch, acc)
+    # 写入ps.csv
+    os.makedirs("logs", exist_ok=True)
+    with open("logs/ps.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ps", "Params", "sec/epoch", "accuracy"])
+        for row in patch_results:
+            w.writerow(row)
 
-    # ---- Embedding Dim ----
+    # Embedding Dim Ablation（其余参数均用base_cfg）
     print("\n=== Embedding Dimension Ablation ===")
     best_dim = None
-    for dim in [96, 128, 256]:
-        # 确保可整除
+    dim_results = []
+    for dim in [96, 192, 256]:
         heads = base_cfg["heads"]
         if dim % heads != 0:
             continue
-        acc, sec, params = run_ablation(train_loader, val_loader, device, cfg,
-                                        patch_size=best_patch[0] if best_patch else base_cfg["patch_size"],
-                                        dim=dim, depth=base_cfg["depth"], heads=heads,
-                                        tag_prefix="dim_")
+        acc, sec, params, history, name = run_ablation(
+            train_loader, val_loader, device, cfg,
+            patch_size=base_cfg["patch_size"],
+            dim=dim, depth=base_cfg["depth"], heads=heads,
+            tag_prefix="dim_")
         results.append(("dim", dim, acc, sec, params))
+        dim_results.append((dim, params, sec, acc))
+        plot_curves(history, cfg.batch_size, cfg.epochs, name)
         if (best_dim is None) or (acc > best_dim[1]):
             best_dim = (dim, acc)
+    # 写入dim.csv
+    with open("logs/dim.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["dim", "Params", "sec/epoch", "accuracy"])
+        for row in dim_results:
+            w.writerow(row)
 
-    # ---- Depth ----
+    # Depth Ablation（其余参数均用base_cfg）
     print("\n=== Depth Ablation ===")
     best_depth = None
+    depth_results = []
     for depth in [4, 6, 12]:
-        acc, sec, params = run_ablation(train_loader, val_loader, device, cfg,
-                                        patch_size=best_patch[0] if best_patch else base_cfg["patch_size"],
-                                        dim=best_dim[0] if best_dim else base_cfg["dim"],
-                                        depth=depth, heads=base_cfg["heads"],
-                                        tag_prefix="depth_")
+        acc, sec, params, history, name = run_ablation(
+            train_loader, val_loader, device, cfg,
+            patch_size=base_cfg["patch_size"],
+            dim=base_cfg["dim"],
+            depth=depth, heads=base_cfg["heads"],
+            tag_prefix="depth_")
         results.append(("depth", depth, acc, sec, params))
+        depth_results.append((depth, params, sec, acc))
+        plot_curves(history, cfg.batch_size, cfg.epochs, name)
         if (best_depth is None) or (acc > best_depth[1]):
             best_depth = (depth, acc)
+    # 写入depth.csv
+    with open("logs/depth.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["depth", "Params", "sec/epoch", "accuracy"])
+        for row in depth_results:
+            w.writerow(row)
 
-    # ---- Heads ----
+    # Heads Ablation（其余参数均用base_cfg）
     print("\n=== Heads Ablation ===")
     best_heads = None
-    # 与 dim=128 兼容的 heads
-    for heads in [1, 2, 4, 8, 16]:
-        dim = best_dim[0] if best_dim else base_cfg["dim"]
+    heads_results = []
+    for heads in [1, 3, 8, 96]:
+        dim = base_cfg["dim"]
         if dim % heads != 0:
             continue
-        acc, sec, params = run_ablation(train_loader, val_loader, device, cfg,
-                                        patch_size=best_patch[0] if best_patch else base_cfg["patch_size"],
-                                        dim=dim, depth=best_depth[0] if best_depth else base_cfg["depth"],
-                                        heads=heads, tag_prefix="heads_")
+        acc, sec, params, history, name = run_ablation(
+            train_loader, val_loader, device, cfg,
+            patch_size=base_cfg["patch_size"],
+            dim=dim, depth=base_cfg["depth"],
+            heads=heads, tag_prefix="heads_")
         results.append(("heads", heads, acc, sec, params))
+        heads_results.append((heads, params, sec, acc))
+        plot_curves(history, cfg.batch_size, cfg.epochs, name)
         if (best_heads is None) or (acc > best_heads[1]):
             best_heads = (heads, acc)
+    # 写入heads.csv
+    with open("logs/heads.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["heads", "Params", "sec/epoch", "accuracy"])
+        for row in heads_results:
+            w.writerow(row)
 
     # ---- 汇总打印 ----
     print("\n=== Ablation Results (best val acc per config) ===")
@@ -449,13 +546,19 @@ def main(cfg: Cfg):
         depth=best_depth[0],
         heads=best_heads[0],
     )
-    final_acc, final_sec, final_params = run_ablation(train_loader, val_loader, device, cfg, **final_cfg,
-                                                      tag_prefix="final_")
+    final_acc, final_sec, final_params, final_history, final_name = run_ablation(
+        train_loader, val_loader, device, cfg, **final_cfg, tag_prefix="final_")
+    plot_curves(final_history, cfg.batch_size, cfg.epochs, final_name)
     print(
         f"\nFinal Combo: {final_cfg} | acc={final_acc:.4f} | params={final_params / 1e6:.2f}M | sec/epoch={final_sec:.3f}")
 
-    print("\nDone.")
+    # 写入best_csv
+    with open("logs/best_csv.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["", "Params", "sec/epoch", "accuracy"])
+        w.writerow(["", final_params, final_sec, final_acc])
 
+    print("\nDone.")
 
 if __name__ == "__main__":
     main(cfg)

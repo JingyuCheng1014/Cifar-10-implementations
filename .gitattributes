@@ -1,0 +1,2 @@
+swin_t_cifar10_best.pth filter=lfs diff=lfs merge=lfs -text
+vit_cifar10_best.pth filter=lfs diff=lfs merge=lfs -text
