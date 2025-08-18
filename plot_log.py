@@ -96,6 +96,7 @@ def plot_all_in_dir(logs_dir, outdir="logs/plots", show=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot training logs from CSV (loss/accuracy).")
+    parser.add_argument("--file", "-f", help="single csv file to plot")
     parser.add_argument("--dir", "-d", default="logs", help="directory containing csv log files")
     parser.add_argument("--outdir", "-o", default="logs/plots", help="output directory for pngs")
     parser.add_argument("--no-show", action="store_true", help="do not display plots (only save)")
@@ -106,4 +107,9 @@ if __name__ == "__main__":
         import matplotlib
         matplotlib.use("Agg")
 
-    plot_all_in_dir(args.dir, outdir=args.outdir, show=not args.no_show)
+    
+    # 如果提供了单个文件，则只绘制该文件
+    if args.file:
+        plot_from_csv(args.file, outdir=args.outdir, show=args.no_show)
+    else:
+        plot_all_in_dir(args.dir, outdir=args.outdir, show=args.no_show)

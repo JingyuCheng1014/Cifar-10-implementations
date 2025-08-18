@@ -376,22 +376,22 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    num_epochs = 10
+    num_epochs = 50
     learning_rate = 1e-4
 
     # 使用预训练权重加载 resnet18（先加载1000类预训练权重）
     print("Loading pretrained weights for fine tuning.")
     model = resnet18(weights=ResNet18_Weights.DEFAULT, progress=True, num_classes=1000).to(device)
-    # 过滤掉预训练权重中的 fc 部分，因为预训练是1000类，而我们需要257类
+    # 过滤掉预训练权重中的 fc 部分，因为预训练是1000类，而我们需要10类
     model_dict = model.state_dict()
     pretrained_dict = ResNet18_Weights.DEFAULT.get_state_dict(progress=True, check_hash=True)
     pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and not k.startswith("fc.")}
     model_dict.update(pretrained_dict)
     model.load_state_dict(model_dict)
-    print("Pretrained weights loaded. Now replacing fc layer for 257 classes.")
-    # 替换最后全连接层，保持输入维度不变，输出设为257
+    print("Pretrained weights loaded. Now replacing fc layer for 10 classes.")
+    # 替换最后全连接层，保持输入维度不变，输出设为10
     in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, 257).to(device)
+    model.fc = nn.Linear(in_features, 10).to(device)
 
     criterion = nn.CrossEntropyLoss()
     # optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=5e-4)

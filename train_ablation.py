@@ -34,7 +34,7 @@ cfg = Cfg(
     data_root="./data",
     batch_size=512,
     num_workers=4,
-    epochs=2,
+    epochs=100,
 )
 
 

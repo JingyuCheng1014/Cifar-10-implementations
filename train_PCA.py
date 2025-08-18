@@ -2,6 +2,7 @@ import os
 import math
 import time
 from dataclasses import dataclass
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -12,7 +13,7 @@ from tqdm import tqdm
 from sklearn.decomposition import PCA
 
 from data.cifar10 import get_dataloaders
-from model.resnet18 import resnet18
+from model.resnet18 import resnet18, train as resnet18_train
 from config import cfg as cfg_from_config, VIT, build_model
 from model.vit import ViT
 from model.swin import swin_t, swin_s, swin_b, swin_l
@@ -40,9 +41,9 @@ class Cfg:
 # 你可以改这里的默认 batch/epochs
 cfg = Cfg(
     data_root="./data",
-    batch_size=512,
+    batch_size=128,
     num_workers=4,
-    epochs=100,
+    epochs=50,
 )
 
 
@@ -241,6 +242,18 @@ def plot_pca_comparison(resnet_features, vit_features, labels, classes, outdir="
     vit_pca = PCA(n_components=2)
     vit_reduced = vit_pca.fit_transform(vit_features)
     
+    # Determine common axis limits
+    all_x = np.concatenate([resnet_reduced[:, 0], vit_reduced[:, 0]])
+    all_y = np.concatenate([resnet_reduced[:, 1], vit_reduced[:, 1]])
+    x_min, x_max = all_x.min(), all_x.max()
+    y_min, y_max = all_y.min(), all_y.max()
+    
+    # Add some margin
+    x_margin = (x_max - x_min) * 0.05
+    y_margin = (y_max - y_min) * 0.05
+    x_min, x_max = x_min - x_margin, x_max + x_margin
+    y_min, y_max = y_min - y_margin, y_max + y_margin
+    
     # Plot side by side
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
     
@@ -250,6 +263,9 @@ def plot_pca_comparison(resnet_features, vit_features, labels, classes, outdir="
         ax1.scatter(resnet_reduced[idx,0], resnet_reduced[idx,1], label=c, s=10, alpha=0.6)
     ax1.set_title(f"ResNet18 Features PCA")
     ax1.legend(markerscale=2, fontsize=8)
+    ax1.set_xlim(x_min, x_max)
+    ax1.set_ylim(y_min, y_max)
+    ax1.set_aspect('equal', adjustable='box')
     
     # ViT plot
     for i, c in enumerate(classes):
@@ -257,6 +273,9 @@ def plot_pca_comparison(resnet_features, vit_features, labels, classes, outdir="
         ax2.scatter(vit_reduced[idx,0], vit_reduced[idx,1], label=c, s=10, alpha=0.6)
     ax2.set_title(f"ViT Features PCA")
     ax2.legend(markerscale=2, fontsize=8)
+    ax2.set_xlim(x_min, x_max)
+    ax2.set_ylim(y_min, y_max)
+    ax2.set_aspect('equal', adjustable='box')
     
     plt.tight_layout()
     plt.savefig(os.path.join(outdir, "resnet_vs_vit_pca_comparison.png"), dpi=150)
@@ -342,24 +361,103 @@ def main(cfg: Cfg):
     all_features = {}
     all_labels = None
 
+    # ResNet18 - 使用与resnet18.py相同的训练参数和方法
+    learning_rate = 1e-4
+
+    # 使用预训练权重加载 resnet18（先加载1000类预训练权重）
+    print("Loading pretrained weights for fine tuning.")
+    from model.resnet18 import ResNet18_Weights
+    model = resnet18(weights=ResNet18_Weights.DEFAULT, progress=True, num_classes=1000).to(device)
+    # 过滤掉预训练权重中的 fc 部分，因为预训练是1000类，而我们需要10类
+    model_dict = model.state_dict()
+    pretrained_dict = ResNet18_Weights.DEFAULT.get_state_dict(progress=True, check_hash=True)
+    pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and not k.startswith("fc.")}
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(model_dict)
+    print("Pretrained weights loaded. Now replacing fc layer for 10 classes.")
+    # 替换最后全连接层，保持输入维度不变，输出设为10类
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, 10).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    # optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=5e-4)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=5e-4)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+
+    train_losses = []
+    test_losses = []
+    train_accs = []
+    test_accs = []
+
+    best_acc = 0.0
+    best_state = None
+
+    t0 = time.perf_counter()
+    
+    for epoch in range(1, cfg.epochs + 1):
+        resnet18_train(epoch, model, train_loader, criterion, optimizer, device)
+        from model.resnet18 import evaluate_loss, evaluate_accuracy, test
+        test(epoch, model, val_loader, criterion, device)
+        epoch_train_loss = evaluate_loss(model, train_loader, criterion, device)
+        epoch_test_loss = evaluate_loss(model, val_loader, criterion, device)
+        epoch_train_acc = evaluate_accuracy(model, train_loader, device)
+        epoch_test_acc = evaluate_accuracy(model, val_loader, device)
+        train_losses.append(epoch_train_loss)
+        test_losses.append(epoch_test_loss)
+        train_accs.append(epoch_train_acc)
+        test_accs.append(epoch_test_acc)
+
+        # 修改: 保存最佳模型
+        if epoch_test_acc > best_acc:
+            best_acc = epoch_test_acc
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            os.makedirs("checkpoints", exist_ok=True)
+            torch.save(best_state, f"checkpoints/resnet18_best.pth")
+            print(f" ✓ Saved best model (acc={best_acc:.4f})")
+
+        print("Epoch {} Summary: Train Loss: {:.4f}, Train Acc: {:.2f}%, Test Loss: {:.4f}, Test Acc: {:.2f}%".format(
+            epoch, epoch_train_loss, epoch_train_acc, epoch_test_loss, epoch_test_acc))
+        scheduler.step()
+        
+        
+
+    t1 = time.perf_counter()
+    sec_total = t1 - t0
+    sec_per_epoch = sec_total / cfg.epochs
+    resnet_acc = best_acc
+    resnet_sec = sec_per_epoch
+    print(f"ResNet18 finished. Best Val Acc: {best_acc:.4f} | sec/epoch: {sec_per_epoch:.3f} | total: {sec_total:.1f}s")
+
+    # 保存训练日志
+    os.makedirs("logs", exist_ok=True)
+    log_path = os.path.join("logs", f"pca_resnet18_log.csv")
+    with open(log_path, "w", newline="") as f:
+        import csv
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "train_loss", "train_acc", "val_loss", "val_acc"])
+        for i in range(cfg.epochs):
+            writer.writerow([
+                i + 1,
+                train_losses[i],
+                train_accs[i],
+                test_losses[i],
+                test_accs[i]
+            ])
+    print(f"Log saved: {log_path}")
+
+    # PCA on validation set
+    resnet_features, labels = extract_features(model, val_loader, device)
+    all_features["resnet18"] = resnet_features
+    if all_labels is None:
+        all_labels = labels
+    plot_pca(resnet_features, labels, classes, "resnet18", outdir="PCA")
+
     # ViT
     model_vit = build_model("vit", **VIT).to(device)
     vit_acc, vit_sec = run_and_pca(model_vit, "vit", train_loader, val_loader, classes, device, cfg)
     vit_features, labels = extract_features(model_vit, val_loader, device)
     all_features["vit"] = vit_features
     all_labels = labels
-
-    # ResNet18
-    model_resnet = resnet18(num_classes=10).to(device)
-    resnet_acc, resnet_sec = run_and_pca(model_resnet, "resnet18", train_loader, val_loader, classes, device, cfg)
-    resnet_features, _ = extract_features(model_resnet, val_loader, device)
-    all_features["resnet18"] = resnet_features
-
-    # Swin Transformer
-    model_swin = swin_t(num_classes=10).to(device)
-    swin_acc, swin_sec = run_and_pca(model_swin, "swin_t", train_loader, val_loader, classes, device, cfg)
-    swin_features, _ = extract_features(model_swin, val_loader, device)
-    all_features["swin_t"] = swin_features
 
     # Generate individual PCA plots
     print("\n==== Generating individual PCA plots ====")
@@ -370,69 +468,10 @@ def main(cfg: Cfg):
     print("\n==== Generating comparison plots ====")
     # ResNet vs ViT
     plot_pca_comparison(all_features["resnet18"], all_features["vit"], all_labels, classes, outdir="PCA")
-    
-    # Create a function to plot all three models side by side
-    def plot_pca_comparison_three(resnet_features, vit_features, swin_features, labels, classes, outdir="PCA"):
-        """
-        Compare PCA plots of ResNet, ViT and Swin features side by side
-        """
-        os.makedirs(outdir, exist_ok=True)
-        
-        # ResNet PCA
-        resnet_pca = PCA(n_components=2)
-        resnet_reduced = resnet_pca.fit_transform(resnet_features)
-        
-        # ViT PCA
-        vit_pca = PCA(n_components=2)
-        vit_reduced = vit_pca.fit_transform(vit_features)
-        
-        # Swin PCA
-        swin_pca = PCA(n_components=2)
-        swin_reduced = swin_pca.fit_transform(swin_features)
-        
-        # Plot side by side
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
-        
-        # ResNet plot
-        for i, c in enumerate(classes):
-            idx = labels == i
-            ax1.scatter(resnet_reduced[idx,0], resnet_reduced[idx,1], label=c, s=10, alpha=0.6)
-        ax1.set_title(f"ResNet18 Features PCA")
-        ax1.legend(markerscale=2, fontsize=8)
-        
-        # ViT plot
-        for i, c in enumerate(classes):
-            idx = labels == i
-            ax2.scatter(vit_reduced[idx,0], vit_reduced[idx,1], label=c, s=10, alpha=0.6)
-        ax2.set_title(f"ViT Features PCA")
-        ax2.legend(markerscale=2, fontsize=8)
-        
-        # Swin plot
-        for i, c in enumerate(classes):
-            idx = labels == i
-            ax3.scatter(swin_reduced[idx,0], swin_reduced[idx,1], label=c, s=10, alpha=0.6)
-        ax3.set_title(f"Swin Transformer Features PCA")
-        ax3.legend(markerscale=2, fontsize=8)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(outdir, "resnet_vit_swin_pca_comparison.png"), dpi=150)
-        plt.close()
-        print(f"PCA three-way comparison plot saved: {os.path.join(outdir, 'resnet_vit_swin_pca_comparison.png')}")
-
-    # Generate three-way comparison
-    plot_pca_comparison_three(
-        all_features["resnet18"], 
-        all_features["vit"], 
-        all_features["swin_t"], 
-        all_labels, 
-        classes, 
-        outdir="PCA"
-    )
 
     print("\n=== Summary ===")
     print(f"ResNet18: acc={resnet_acc:.4f}, sec/epoch={resnet_sec:.3f}")
     print(f"ViT     : acc={vit_acc:.4f}, sec/epoch={vit_sec:.3f}")
-    print(f"Swin T  : acc={swin_acc:.4f}, sec/epoch={swin_sec:.3f}")
 
 if __name__ == "__main__":
     main(cfg)
