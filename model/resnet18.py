@@ -10,6 +10,11 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from data.cifar10 import get_dataloaders
+from config import cfg
+
 ##############################
 # 1. 定义数据预处理和 DataLoader（使用 Caltech256 数据集）
 ##############################
@@ -29,17 +34,18 @@ val_transform = transforms.Compose([
                          (0.229, 0.224, 0.225))
 ])
 
-data_dir = "./data/cifar10.py"
-dataset = datasets.ImageFolder(root=data_dir, transform=train_transform)
-train_size = int(0.8 * len(dataset))
-val_size = len(dataset) - train_size
-train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-train_dataset.dataset.transform = train_transform
-val_dataset.dataset.transform = val_transform
+# data_dir = "./data"
+# dataset = datasets.ImageFolder(root=data_dir, transform=train_transform)
+# train_size = int(0.8 * len(dataset))
+# val_size = len(dataset) - train_size
+# train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+# train_dataset.dataset.transform = train_transform
+# val_dataset.dataset.transform = val_transform
 
 batch_size = 128
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-test_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+train_loader, test_loader = get_dataloaders(cfg)
+# train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+# test_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
 ##############################################
 # 2. 定义 ResNet 模型（内部结构完全依照你发送的代码）
@@ -406,6 +412,8 @@ def main():
         epoch_test_acc = evaluate_accuracy(model, test_loader, device)
         train_losses.append(epoch_train_loss)
         test_losses.append(epoch_test_loss)
+        train_accs.append(epoch_train_acc)
+        test_accs.append(epoch_test_acc)
         print("Epoch {} Summary: Train Loss: {:.4f}, Train Acc: {:.2f}%, Test Loss: {:.4f}, Test Acc: {:.2f}%".format(
             epoch, epoch_train_loss, epoch_train_acc, epoch_test_loss, epoch_test_acc))
         scheduler.step()
