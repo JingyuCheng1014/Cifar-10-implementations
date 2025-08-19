@@ -2,8 +2,13 @@ import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+from einops import rearrange, repeat
 
 
+
+# =========================
+# 1) Baseline ViT
+# =========================
 
 def pair(t):
     """
@@ -295,3 +300,196 @@ class ViT(nn.Module):
         return self.mlp_head(x)
 
 
+
+
+
+# =========================
+# 2) Improved ViT(Conv Patch + Window MSA)
+# =========================
+
+
+
+# ---------- 1) 卷积式 Patch Embedding（Swin 思路） ----------
+class ConvPatchEmbed(nn.Module):
+    """
+    Conv2d(kernel=stride=patch) 做 patch 投影；可选 token 级 LayerNorm
+    输出:
+      tokens: (B, N, C), grid: (H, W)
+    """
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=96, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.norm = norm_layer(embed_dim) if norm_layer is not None else None
+
+    def forward(self, x):
+        # B,C,H,W -> B,embed_dim,H',W'
+        x = self.proj(x)
+        B, C, H, W = x.shape
+        # B,N,C
+        x = x.flatten(2).transpose(1, 2).contiguous()
+        if self.norm is not None:
+            x = self.norm(x)
+        return x, (H, W)
+
+# ---------- 2) window 工具（Swin 的 window process 思路） ----------
+def window_partition(x, window_size):
+    """
+    x: (B, H, W, C) -> (num_windows*B, window_size*window_size, C)
+    """
+    B, H, W, C = x.shape
+    assert H % window_size == 0 and W % window_size == 0, "H/W must be divisible by window_size"
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    # (B, nH, nW, ws, ws, C) -> (B*nH*nW, ws*ws, C)
+    windows = x.permute(0,1,3,2,4,5).contiguous().view(-1, window_size * window_size, C)
+    return windows
+
+def window_reverse(windows, window_size, H, W):
+    """
+    windows: (num_windows*B, ws*ws, C) -> x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] // (H * W // window_size // window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0,1,3,2,4,5).contiguous().view(B, H, W, -1)
+    return x
+
+# ---------- 3) 相对位置偏置（简版，参考 Swin） ----------
+def get_rel_pos_index(window_size):
+    """
+    生成窗口内 pair-wise 相对坐标索引表，用于查 relative_position_bias_table
+    返回 (ws*ws, ws*ws) 的 index 矩阵，值域 [0, (2*ws-1)^2)
+    """
+    ws = window_size
+    coords = torch.stack(torch.meshgrid(torch.arange(ws), torch.arange(ws), indexing='ij'))  # 2, ws, ws
+    coords_flatten = torch.flatten(coords, 1)  # 2, ws*ws
+    rel_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, N, N
+    rel_coords = rel_coords.permute(1, 2, 0).contiguous()  # N, N, 2
+    rel_coords[:, :, 0] += ws - 1
+    rel_coords[:, :, 1] += ws - 1
+    rel_coords[:, :, 0] *= 2 * ws - 1
+    rel_pos_index = rel_coords.sum(-1)  # N, N
+    return rel_pos_index  # (ws*ws, ws*ws)
+
+class WindowMSA(nn.Module):
+    """
+    窗口内多头注意力（可选相对位置偏置）；输入 shape: (num_windows*B, N, C)
+    """
+    def __init__(self, dim, window_size=4, num_heads=8, qkv_bias=True, attn_drop=0., proj_drop=0., use_rel_pos_bias=True):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.use_rel_pos_bias = use_rel_pos_bias
+        if use_rel_pos_bias:
+            # (2*ws-1)^2, nH
+            self.relative_position_bias_table = nn.Parameter(
+                torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads))
+            rel_index = get_rel_pos_index(window_size)  # (N, N)
+            self.register_buffer("relative_position_index", rel_index, persistent=False)
+            nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+    def forward(self, x):
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads)
+        q, k, v = qkv.unbind(dim=2)  # each: (B_, N, nH, d)
+        q = q.permute(0,2,1,3)  # B_, nH, N, d
+        k = k.permute(0,2,1,3)
+        v = v.permute(0,2,1,3)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # B_, nH, N, N
+
+        if self.use_rel_pos_bias:
+            rel_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)]
+            rel_bias = rel_bias.view(self.window_size * self.window_size,
+                                     self.window_size * self.window_size, -1)  # N,N,nH
+            rel_bias = rel_bias.permute(2,0,1).unsqueeze(0)  # 1,nH,N,N
+            attn = attn + rel_bias
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1,2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class MLP(nn.Module):
+    def __init__(self, dim, mlp_ratio=4., drop=0.):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.fc1 = nn.Linear(dim, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, dim)
+        self.drop = nn.Dropout(drop)
+    def forward(self, x):
+        x = self.fc1(x); x = self.act(x); x = self.drop(x)
+        x = self.fc2(x); x = self.drop(x)
+        return x
+
+class WinBlock(nn.Module):
+    """
+    单个 block：LN -> WindowMSA -> 残差；LN -> MLP -> 残差
+    这里不实现 Swin 的 shift（保持简单稳定），如需 SW-MSA 可再加 shift+mask。
+    """
+    def __init__(self, dim, window_size=4, num_heads=8, mlp_ratio=4., drop=0., attn_drop=0.):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = WindowMSA(dim, window_size, num_heads, qkv_bias=True, attn_drop=attn_drop, proj_drop=drop)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, mlp_ratio=mlp_ratio, drop=drop)
+        self.window_size = window_size
+
+    def forward(self, x, H, W):
+        # x: (B, N, C)
+        B, N, C = x.shape
+        ws = self.window_size
+        # (B,N,C)->(B,H,W,C)
+        x_ = x.view(B, H, W, C)
+
+        # window attention
+        windows = window_partition(self.norm1(x_), ws)                      # (BnW, ws*ws, C)
+        windows = self.attn(windows)                                        # (BnW, ws*ws, C)
+        x_ = window_reverse(windows, ws, H, W)                              # (B,H,W,C)
+
+        x = x + x_.view(B, N, C)                                           # 残差
+        x = x + self.mlp(self.norm2(x))                                    # FFN 残差
+        return x
+
+# ---------- 4) 改进版 ViT（卷积 patch + window MSA） ----------
+class ViTConvWin(nn.Module):
+    """
+    改进版 ViT：
+      - Conv patch embedding（Swin风格）
+      - 每层使用窗口化 self-attention（非 shift），计算复杂度降到 O(nW * ws^4)
+      - 末端用 mean pooling（不使用 CLS token）
+    """
+    def __init__(self, *, image_size=32, patch_size=4, num_classes=10,
+                 dim=256, depth=6, heads=8, mlp_ratio=4., window_size=4,
+                 in_chans=3, dropout=0., attn_drop=0.):
+        super().__init__()
+        self.patch_embed = ConvPatchEmbed(img_size=image_size, patch_size=patch_size,
+                                          in_chans=in_chans, embed_dim=dim, norm_layer=nn.LayerNorm)
+        self.blocks = nn.ModuleList([
+            WinBlock(dim=dim, window_size=window_size, num_heads=heads,
+                     mlp_ratio=mlp_ratio, drop=dropout, attn_drop=attn_drop)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, num_classes)
+
+    def forward(self, img):
+        # tokens: (B,N,C), grid: (H',W')
+        x, (H, W) = self.patch_embed(img)
+        for blk in self.blocks:
+            x = blk(x, H, W)
+        x = self.norm(x)
+        # mean pooling（Swin 不用 CLS）
+        x = x.mean(dim=1)
+        return self.head(x)

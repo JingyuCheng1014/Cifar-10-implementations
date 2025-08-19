@@ -40,12 +40,20 @@ PY
  (will automatically download CIFAR-10 to ./data/)
 
 ```bash
-python train.py
+# Train ResNet18 (CIFAR‑style stem, no pre-training by default):
+python train.py --model resnet18
+# Training baseline ViT:
+python train.py --model vit
+# Improved training version (Conv Patch + Window MSA):
+python train.py --model vit_convwin
 ```
 
 ## 4. Training with Ablation Study
 adjust the parameters (patch size, dim, depth, heads) and compare training results.
 ```bash
+# Ablation of Baseline ViT
+
+# Ablation of ViTConvWin (convolutional patch + window attention)
 python train_ablation.py
 ```
 
