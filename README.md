@@ -42,8 +42,10 @@ PY
 ```bash
 # Train ResNet18 (CIFAR‑style stem, no pre-training by default):
 python train.py --model resnet18
+
 # Training baseline ViT:
 python train.py --model vit
+
 # Improved training version (Conv Patch + Window MSA):
 python train.py --model vit_convwin
 ```
@@ -52,9 +54,10 @@ python train.py --model vit_convwin
 adjust the parameters (patch size, dim, depth, heads) and compare training results.
 ```bash
 # Ablation of Baseline ViT
+python train_ablation.py --model vit
 
 # Ablation of ViTConvWin (convolutional patch + window attention)
-python train_ablation.py
+python train_ablation.py --model vit_convwin
 ```
 
 ## 5. Evaluation/Verification
@@ -67,3 +70,12 @@ python eval.py --ckpt checkpoints/tinycnn_cifar10_best.pth --data_root ./data --
 
 ```
 
+## 6. Visualization
+
+### 6.1 Compare Resnet and ViT
+
+You can use 'train_PCA.py' to visualize the feature space.
+
+### 6.2 Graphs
+
+Omitted, see 'train.py' for details.
